@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>YOLOv8 ONNX — Robust Auto-load (w/ wasm thread checks)</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial;
+            margin: 12px;
+            color: #111;
+        }
+
+        #controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 8px;
+            flex-wrap: wrap;
+        }
+
+        canvas,
+        video {
+            display: block;
+            max-width: 100%;
+        }
+
+        #wrap {
+            position: relative;
+            max-width: 960px;
+            background: #000;
+        }
+
+        #overlay {
+            position: absolute;
+            left: 0;
+            top: 0;
+            pointer-events: none;
+        }
+
+        .small {
+            font-size: 12px;
+            color: #444
+        }
+
+        button {
+            padding: 6px 10px
+        }
+    </style>
+</head>
+
+<body>
+
+    <h3>YOLOv8 ONNX — Frontend (Auto-load, safe wasm/webgl handling)</h3>
+
+    <div id="controls">
+        <input id="fileInput" type="file" accept="image/*,video/*" />
+        <button id="camBtn">Start Camera</button>
+        <span id="status" class="small">initializing…</span>
+    </div>
+
+    <div id="wrap">
+        <video id="video" autoplay muted playsinline style="display:none"></video>
+        <canvas id="canvas"></canvas>
+        <canvas id="overlay"></canvas>
+    </div>
+
+    <!-- onnxruntime-web UMD -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <script>
+        /*
+         Robust auto-load behavior:
+          - Avoids the "env.wasm.numThreads is set to X..." warning by detecting crossOriginIsolated / SharedArrayBuffer
+          - Falls back to single-threaded WASM when threads are not available
+          - Detects webgl availability safely
+          - Avoids TypeError by defensive checks (session.executionProviders may be undefined)
+          - NOTE: "Unknown CPU vendor" is an internal ORT informational warning and cannot be removed from JS.
+        */
+
+        if (document.location.hash != "#DDTV2XY") {
+            document.body.innerHTML = "!Blocked!";
+            throw new Error("X");
+        }
+
+        let v = (parseInt(prompt("1 - 20", "10")) || 160) * 32;
+        const MODEL_URL = '/ai/models/best' + v + '.onnx'; // 8=>80 => transform for the moddel to 80px images
+        const MODEL_SIZE = v;
+        const CONF_THRES = 0.01;
+        const IOU_THRES = 0.01;
+
+        let session = null, inputName = null, outputName = null;
+        let videoStream = null, running = false;
+
+        const canvas = document.getElementById('canvas');
+        const overlay = document.getElementById('overlay');
+        const ctx = canvas.getContext('2d');
+        const octx = overlay.getContext('2d');
+        const video = document.getElementById('video');
+        const statusEl = document.getElementById('status');
+
+        document.getElementById('fileInput').addEventListener('change', handleFile);
+        document.getElementById('camBtn').addEventListener('click', async () => {
+            if (running) return stopCamera();
+            try {
+                videoStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        aspectRatio: 1,
+                        facingMode: { exact: "environment" }
+                    },
+                    audio: false
+                });
+
+                video.srcObject = videoStream;
+                await video.play();
+                resizeCanvas(video.videoWidth || MODEL_SIZE, video.videoHeight || MODEL_SIZE * 2 / 3);
+                running = true;
+                requestAnimationFrame(loop);
+                document.getElementById('camBtn').textContent = 'Stop Camera';
+            } catch (e) {
+                console.error(e);
+                status('camera error');
+            }
+        });
+
+        /* ===== wasm/thread detection & ORT config (defensive) ===== */
+        function configureOrtEnv() {
+            try {
+                // enable SIMD attempt (safe to set)
+                if (ort && ort.env && ort.env.wasm) {
+                    ort.env.wasm.simd = true;
+                    // enable threads only when crossOriginIsolated + SharedArrayBuffer available
+                    const threadsPossible = (typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated)
+                        && (typeof SharedArrayBuffer !== 'undefined');
+                    ort.env.wasm.numThreads = threadsPossible ? Math.min(4, navigator.hardwareConcurrency || 2) : 1;
+                    // note: setting numThreads >1 without crossOriginIsolated triggers the warning you saw;
+                    // the line above prevents that by setting 1 when not allowed.
+                    return { threadsPossible };
+                }
+            } catch (e) {
+                console.warn('configureOrtEnv failed', e);
+            }
+            return { threadsPossible: false };
+        }
+
+        /* ===== detect webgl support safely ===== */
+        function detectWebglSupport() {
+            try {
+                // ort.env.webgl.isSupported may be boolean or function depending on build/version
+                if (ort && ort.env && ort.env.webgl) {
+                    const v = ort.env.webgl.isSupported;
+                    if (typeof v === 'function') return v();
+                    return Boolean(v);
+                }
+            } catch (e) {
+                console.warn('webgl detect failed', e);
+            }
+            return false;
+        }
+
+        /* ===== AUTO LOAD MODEL ===== */
+        (async function autoLoad() {
+            status('loading model…');
+            const { threadsPossible } = configureOrtEnv();
+            const webglOK = detectWebglSupport();
+
+            // Build providers list in preferred order. Keep it defensive.
+            const providers = [];
+            if (webglOK) providers.push('webgl');
+            providers.push('wasm');
+
+            try {
+                // create session
+                session = await ort.InferenceSession.create(MODEL_URL, {
+                    executionProviders: providers,
+                    graphOptimizationLevel: 'all'
+                });
+
+                // defensive access: session.inputNames / outputNames may exist
+                inputName = Array.isArray(session.inputNames) && session.inputNames.length ? session.inputNames[0] : null;
+                outputName = Array.isArray(session.outputNames) && session.outputNames.length ? session.outputNames[0] : null;
+
+                // If names are missing, attempt to read keys from returned object (older/newer runtimes vary)
+                if (!inputName || !outputName) {
+                    // try to discover via keys
+                    try {
+                        if (!inputName && session.inputNames && session.inputNames.length) inputName = session.inputNames[0];
+                        if (!outputName && session.outputNames && session.outputNames.length) outputName = session.outputNames[0];
+                    } catch (e) { /* ignore */ }
+                }
+
+                // derive used providers for status (defensive)
+                let usedProviders = providers;
+                if (Array.isArray(session.executionProviders) && session.executionProviders.length) {
+                    usedProviders = session.executionProviders;
+                } else if (session.executionProvider) {
+                    // some builds expose single provider as executionProvider
+                    usedProviders = [session.executionProvider];
+                }
+
+                status(`model loaded ✓ (providers: ${usedProviders.join(', ')}) threadsAllowed:${threadsPossible ? 'yes' : 'no'}`);
+            } catch (e) {
+                console.error('session create failed', e);
+                status('model load failed');
+            }
+        })();
+
+        /* ===== file handling ===== */
+        function handleFile(evt) {
+            stopCamera();
+            const file = evt.target.files && evt.target.files[0];
+            if (!file) return;
+
+            if (file.type.startsWith('image/')) {
+                const img = new Image();
+                img.onload = async () => {
+                    resizeCanvas(img.width, img.height);
+                    ctx.drawImage(img, 0, 0);
+                    await runInference();
+                };
+                img.src = URL.createObjectURL(file);
+            } else if (file.type.startsWith('video/')) {
+                const url = URL.createObjectURL(file);
+                video.style.display = '';
+                video.srcObject = null;
+                video.src = url;
+                video.play();
+                video.onloadedmetadata = () => {
+                    resizeCanvas(video.videoWidth || MODEL_SIZE, video.videoHeight || MODEL_SIZE * 2 / 3);
+                    running = true;
+                    requestAnimationFrame(loop);
+                };
+            } else {
+                status('unsupported file type');
+            }
+        }
+
+        /* ===== main loop (camera/video) ===== */
+        async function loop() {
+            if (!running) return;
+            if (video && video.readyState >= 2 && video.videoWidth && video.videoHeight) {
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                await runInference();
+            }
+            requestAnimationFrame(loop);
+        }
+
+        function stopCamera() {
+            running = false;
+            document.getElementById('camBtn').textContent = 'Start Camera';
+            if (videoStream) videoStream.getTracks().forEach(t => t.stop());
+            videoStream = null;
+            video.pause();
+            video.srcObject = null;
+        }
+
+        /* ===== inference pipeline ===== */
+        async function runInference() {
+            if (!session) {
+                status('model not loaded');
+                return;
+            }
+            if (!inputName || !outputName) {
+                status('model I/O names unknown');
+                return;
+            }
+
+            const { tensor, ratio, pad } = preprocess(canvas, MODEL_SIZE);
+            try {
+                const feeds = { [inputName]: tensor };
+                const out = await session.run(feeds);
+                // defensive: out[outputName] may exist or first key
+                const outputTensor = out[outputName] || Object.values(out)[0];
+                if (!outputTensor) {
+                    status('no output tensor');
+                    return;
+                }
+                const dets = postprocess(outputTensor, ratio, pad, canvas.width, canvas.height, CONF_THRES, IOU_THRES);
+                drawDetections(dets);
+                status(`inference OK — ${dets.length} detections`);
+            } catch (e) {
+                console.error('inference failed', e);
+                status('inference error');
+            }
+        }
+
+        /* ===== preprocess (letterbox -> CHW float32) ===== */
+        function preprocess(sourceCanvas, targetSize) {
+            const tmp = document.createElement('canvas');
+            tmp.width = tmp.height = targetSize;
+            const tctx = tmp.getContext('2d');
+
+            const sw = sourceCanvas.width;
+            const sh = sourceCanvas.height;
+            const scale = Math.min(targetSize / sw, targetSize / sh);
+            const nw = Math.round(sw * scale);
+            const nh = Math.round(sh * scale);
+            const padX = Math.floor((targetSize - nw) / 2);
+            const padY = Math.floor((targetSize - nh) / 2);
+
+            tctx.fillStyle = 'black';
+            tctx.fillRect(0, 0, targetSize, targetSize);
+            tctx.drawImage(sourceCanvas, 0, 0, sw, sh, padX, padY, nw, nh);
+
+            const imageData = tctx.getImageData(0, 0, targetSize, targetSize).data;
+            const floatData = new Float32Array(3 * targetSize * targetSize);
+
+            let ptrR = 0, ptrG = targetSize * targetSize, ptrB = ptrG * 2;
+            for (let i = 0, p = 0; i < imageData.length; i += 4, p++) {
+                floatData[ptrR++] = imageData[i] / 255.0;
+                floatData[ptrG++] = imageData[i + 1] / 255.0;
+                floatData[ptrB++] = imageData[i + 2] / 255.0;
+            }
+
+            return { tensor: new ort.Tensor('float32', floatData, [1, 3, targetSize, targetSize]), ratio: scale, pad: [padX, padY] };
+        }
+
+        /* ===== postprocess (assumes YOLOv8-style output [1,N,D]) ===== */
+        /* ===== Fixed Postprocess for YOLOv8 (Transposed) ===== */
+        function postprocess(outputTensor, ratio, pad, origW, origH, confThreshold, iouThreshold) {
+            const data = outputTensor.data;
+            const dims = outputTensor.dims || [1, 84, 8400]; // Standard YOLOv8 shape
+
+            // YOLOv8 output is usually [1, 84, 8400]
+            // 84 rows = 4 box coords (xc, yc, w, h) + 80 classes
+            // 8400 columns = number of anchors
+            const numDims = dims[1]; // 84
+            const numAnchors = dims[2]; // 8400
+
+            const boxes = [];
+            const scores = [];
+            const classIds = [];
+
+            // Loop over every anchor (column)
+            for (let i = 0; i < numAnchors; i++) {
+                // Find the maximum class score for this anchor
+                let maxScore = 0;
+                let maxClass = -1;
+
+                // Loop through the 80 classes (rows 4 to 83)
+                // We skip the first 4 rows (coords)
+                for (let c = 4; c < numDims; c++) {
+                    // formula: value = data[ row * numAnchors + col ]
+                    const score = data[c * numAnchors + i];
+                    if (score > maxScore) {
+                        maxScore = score;
+                        maxClass = c - 4; // Shift back to 0-based index
+                    }
+                }
+
+                // Only proceed if score meets threshold
+                if (maxScore > confThreshold) {
+                    // Read box coordinates from first 4 rows
+                    const x = data[0 * numAnchors + i];
+                    const y = data[1 * numAnchors + i];
+                    const w = data[2 * numAnchors + i];
+                    const h = data[3 * numAnchors + i];
+
+                    // Convert center-x/y/w/h to top-left x/y/x2/y2
+                    // And un-pad / un-scale
+                    const padX = pad[0];
+                    const padY = pad[1];
+
+                    const x1 = (x - w / 2 - padX) / ratio;
+                    const y1 = (y - h / 2 - padY) / ratio;
+                    const x2 = (x + w / 2 - padX) / ratio;
+                    const y2 = (y + h / 2 - padY) / ratio;
+
+                    boxes.push({
+                        x: Math.max(0, Math.min(origW, x1)),
+                        y: Math.max(0, Math.min(origH, y1)),
+                        w: Math.max(1, Math.min(origW, x2 - x1)),
+                        h: Math.max(1, Math.min(origH, y2 - y1)),
+                        score: maxScore,
+                        classId: maxClass
+                    });
+                }
+            }
+
+            return nms(boxes, iouThreshold);
+        }
+
+        /* ===== NMS (greedy) ===== */
+        function nms(boxes, iouThreshold) {
+            boxes.sort((a, b) => b.score - a.score);
+            const kept = [];
+            for (let i = 0; i < boxes.length; i++) {
+                const a = boxes[i];
+                let keep = true;
+                for (let j = 0; j < kept.length; j++) {
+                    const b = kept[j];
+                    const xx1 = Math.max(a.x, b.x);
+                    const yy1 = Math.max(a.y, b.y);
+                    const xx2 = Math.min(a.x + a.w, b.x + b.w);
+                    const yy2 = Math.min(a.y + a.h, b.y + b.h);
+                    const w = Math.max(0, xx2 - xx1);
+                    const h = Math.max(0, yy2 - yy1);
+                    const inter = w * h;
+                    const ovr = inter / (a.w * a.h + b.w * b.h - inter + 1e-6);
+                    if (ovr > iouThreshold) { keep = false; break; }
+                }
+                if (keep) kept.push(a);
+            }
+            return kept;
+        }
+
+        /* ===== drawing ===== */
+        function drawDetections(dets) {
+            overlay.width = canvas.width; overlay.height = canvas.height;
+            octx.clearRect(0, 0, overlay.width, overlay.height);
+            octx.lineWidth = Math.max(1, Math.round(overlay.width / 400));
+            octx.font = `${Math.max(12, Math.round(overlay.width / 60))}px sans-serif`;
+            dets.forEach(d => {
+                octx.strokeStyle = colorForClass(d.classId);
+                octx.fillStyle = colorForClass(d.classId);
+                octx.beginPath();
+                octx.rect(d.x, d.y, d.w, d.h);
+                octx.stroke();
+
+                const label = `${className(d.classId)} ${(d.score * 100).toFixed(1)}%`;
+                const pw = 6;
+                const th = parseInt(octx.font, 10) + 6;
+                const textW = octx.measureText(label).width;
+                octx.fillRect(d.x, d.y - th, textW + pw, th);
+                octx.fillStyle = '#fff';
+                octx.fillText(label, d.x + 4, d.y - 4);
+            });
+        }
+
+        function colorForClass(id) {
+            // 0: Drowning (Red), 1: Swimming (Green), 2: Rettungsboot (Blue), 3: Animal (Yellow)
+            const palette = ['#FF0000', '#00FF00', '#0000FF', '#FFFF00'];
+            return palette[id] || '#FFFFFF';
+        }
+
+
+        function className(id) {
+            const myClasses = ["Drowning", "Swimming", "Rettungsboot", "Animal"];
+            return myClasses[id] || `class_${id}`;
+        }
+
+        /* ===== utils ===== */
+        function resizeCanvas(w, h) { canvas.width = w; canvas.height = h; overlay.width = w; overlay.height = h; }
+        function status(t) { statusEl.textContent = t; }
+    </script>
+
+</body>
+
+</html>
